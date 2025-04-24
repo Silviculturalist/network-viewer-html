@@ -1,0 +1,672 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Interactive Collaboration Network</title>
+  <style>
+    /* Basic styling for body, sidebar, buttons */
+    body { margin: 0; overflow: hidden; font-family: sans-serif; }
+    #menuToggle { position: absolute; top: 10px; left: 10px; padding: 6px 10px; background: #007ACC; color: white; border: none; cursor: pointer; font-size: 18px; z-index: 1002; border-radius: 4px; }
+    #sidebar { position: absolute; top: 0; left: -360px; width: 360px; height: 100%; background: #f8f8f8; border-right: 1px solid #ccc; padding: 12px; box-sizing: border-box; transition: left 0.3s ease; overflow-y: auto; z-index: 1001; }
+    #sidebar.open { left: 0; }
+    #sidebar h3 { margin-top: 0; }
+    #sidebar p { margin: 8px 0 4px; }
+    #csv-input { width: 100%; height: 120px; box-sizing: border-box; font-family: monospace; border: 1px solid #ccc; border-radius: 4px; padding: 5px; }
+    #loadBtn { margin-top: 8px; padding: 6px 12px; background: #28A745; color: white; border: none; cursor: pointer; border-radius: 4px; }
+
+    /* Styling for the single persistent InfoBox */
+    .infoBox { position: absolute; background: rgba(255, 255, 255, 0.95); border: 2px solid; padding: 8px; box-sizing: border-box; font-size: 12px; z-index: 999; pointer-events: auto; border-radius: 4px; box-shadow: 0 2px 5px rgba(0,0,0,0.2); max-width: 280px; /* Slightly wider */ }
+    .infoBox h4 { margin: 0 0 4px 0; font-size: 14px; }
+    .infoBox table { width: 100%; border-collapse: collapse; margin-top: 5px; }
+    .infoBox th, .infoBox td { border: 1px solid #ddd; padding: 3px 5px; text-align: left; font-size: 11px; } /* Smaller table font */
+    .infoBox th { background-color: #f2f2f2; cursor: pointer; font-weight: bold; }
+    .infoBox p { font-size: 11px; margin: 4px 0; } /* Styling for arc/project info text */
+    .infoBox .close-btn { position: absolute; top: 2px; right: 5px; cursor: pointer; font-weight: bold; color: #555; font-size: 16px; line-height: 1; }
+
+    /* SVG container */
+    svg { display: block; background-color: #fdfdfd; }
+
+    /* Controls styling */
+    #controls { margin-top: 12px; border-top: 1px solid #eee; padding-top: 10px; }
+    .slider-label { font-size: 12px; margin-bottom: 2px; }
+    input[type="range"] { width: 100%; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <button id="menuToggle">☰ CSV & Controls</button>
+
+  <div id="sidebar">
+    <h3>Settings & CSV</h3>
+    <div id="controls">
+      <label class="slider-label" for="chargeSlider">Node Repel Strength: <span id="chargeValue">-200</span></label>
+      <input id="chargeSlider" type="range" min="-1000" max="0" value="-200" step="50">
+      <label class="slider-label" for="widthSlider">Arc Width Multiplier: <span id="widthValue">1.0</span></label>
+      <input id="widthSlider" type="range" min="0.1" max="5" value="1" step="0.1">
+    </div>
+    <h3>Load CSV Data</h3>
+    <p>Rows: each person<br>Cols: each project<br>Values: percent time</p>
+    <textarea id="csv-input" placeholder="Paste CSV data here..."></textarea>
+    <button id="loadBtn">Update Graph</button>
+  </div>
+
+  <svg id="graph"></svg>
+
+  <script src="https://d3js.org/d3.v7.min.js"></script>
+
+  <script>
+    // --- Global Variables ---
+    const svg = d3.select('#graph');
+    const container = svg.append('g');
+    let simulation, nodesData = [], linksData = [];
+    let linkElements, nodeElements;
+    let currentData = [], projectsList = [];
+    let activeContext = null; // Stores the currently active selection (null, node, arc, or project)
+    const colors = d3.schemeCategory10; // Use D3's built-in color scheme
+    let chargeStrength = -200;
+    let widthMultiplier = 1.0;
+    let widthScale;
+    let availableColors = [...colors]; // Keep track of available colors
+
+    // --- Utility Functions ---
+    function sanitizeKey(key) { return key ? key.replace(/[^a-zA-Z0-9_-]/g, '-') : 'invalid-key'; }
+
+    // Context key generation for nodes, arcs, and projects
+    function getContextKey(type, id1, id2 = null, id3 = null) {
+        if (type === 'node') return `node-${sanitizeKey(id1)}`;
+        if (type === 'arc') {
+            const sortedIds = [id1, id2].sort(); // Ensure consistent order
+            return `arc-${sanitizeKey(sortedIds[0])}-${sanitizeKey(sortedIds[1])}-${sanitizeKey(id3)}`;
+        }
+        if (type === 'project') return `project-${sanitizeKey(id1)}`;
+        return `unknown-${sanitizeKey(id1)}`;
+    }
+
+    // Pick the next available color, cycling if necessary
+    function pickColor() {
+        if (availableColors.length === 0) {
+            availableColors = [...colors]; // Reset if exhausted
+        }
+        // Always take the first available color
+        return availableColors.shift();
+    }
+
+    // Return a color to the available pool (if it was used)
+    function releaseColor(color) {
+        if (color && !availableColors.includes(color) && colors.includes(color)) {
+             availableColors.push(color); // Add back to the end
+        }
+    }
+
+
+    function sortTable(table, colIndex) {
+      const tbody = table.tBodies[0];
+      if (!tbody) return;
+      const rows = Array.from(tbody.rows);
+      const currentOrder = table.dataset.order === 'asc' ? 'asc' : 'desc';
+      const nextOrder = currentOrder === 'asc' ? 'desc' : 'asc';
+      const multiplier = nextOrder === 'asc' ? 1 : -1;
+
+      rows.sort((a, b) => {
+        const cellA = a.cells[colIndex];
+        const cellB = b.cells[colIndex];
+        const valA = parseFloat(cellA.textContent.replace('%', '')) || cellA.textContent.trim().toLowerCase();
+        const valB = parseFloat(cellB.textContent.replace('%', '')) || cellB.textContent.trim().toLowerCase();
+        if (typeof valA === 'number' && typeof valB === 'number') {
+          return (valA - valB) * multiplier;
+        } else {
+          return String(valA).localeCompare(String(valB)) * multiplier;
+        }
+      });
+
+      rows.forEach(row => tbody.appendChild(row));
+      table.dataset.order = nextOrder;
+      table.querySelectorAll('th').forEach((th, i) => {
+        th.classList.remove('sort-asc', 'sort-desc');
+        if (i === colIndex) {
+          th.classList.add(nextOrder === 'asc' ? 'sort-asc' : 'sort-desc');
+        }
+      });
+    }
+
+    // --- D3 Graph Update Function ---
+    function updateGraph(data) {
+      // Clear previous graph elements
+      container.selectAll('*').remove();
+      activeContext = null; // Reset active selection
+      updateUI(); // Clear highlights and infobox
+
+      if (!data || !data.length) {
+          console.warn("No data provided to updateGraph.");
+          return;
+      }
+
+      currentData = data;
+      projectsList = data.columns ? data.columns.filter(c => c && c.toLowerCase() !== 'name') : [];
+      if (!projectsList.length && data.length > 0) {
+          projectsList = Object.keys(data[0]).filter(k => k && k.toLowerCase() !== 'name');
+      }
+
+      data.forEach(d => {
+        projectsList.forEach(p => { d[p] = +d[p] || 0; });
+      });
+
+      nodesData = data.map(d => ({ id: d.Name })); // Node objects have an 'id' property
+
+      // Prepare links data (ensure source/target are strings for key generation)
+      let rawLinks = [];
+      data.forEach((d1, i) => {
+        projectsList.forEach(p => {
+          if (d1[p] > 0) {
+            for (let j = i + 1; j < data.length; j++) {
+              const d2 = data[j];
+              if (d2[p] > 0) {
+                rawLinks.push({
+                  source: String(d1.Name), // Link source/target are strings (node IDs)
+                  target: String(d2.Name), // Link source/target are strings (node IDs)
+                  project: p,
+                  weight: d1[p] + d2[p]
+                });
+              }
+            }
+          }
+        });
+      });
+
+      const groupedLinks = d3.groups(rawLinks, d => [d.source, d.target].sort().join('|'));
+      linksData = [];
+      groupedLinks.forEach(([key, group]) => {
+        group.forEach((link, index) => {
+          linksData.push({ ...link, groupIndex: index, groupSize: group.length });
+        });
+      });
+
+      const maxWeight = d3.max(linksData, d => d.weight) || 1;
+      widthScale = d3.scaleLinear().domain([0, maxWeight]).range([0.5, 6]);
+
+      // Create link elements (paths)
+      linkElements = container.append('g')
+        .attr('class', 'links')
+        .selectAll('path')
+        .data(linksData, d => getContextKey('arc', d.source, d.target, d.project))
+        .join('path')
+          .attr('stroke', '#aaa')
+          .attr('stroke-opacity', 0.5)
+          .attr('stroke-width', d => widthScale(d.weight) * widthMultiplier)
+          .attr('fill', 'none')
+          .style('cursor', 'pointer')
+          .attr('pointer-events', 'visibleStroke')
+          .on('click', handleArcClick)
+          .on('mouseover', handleArcMouseover)
+          .on('mouseout', handleArcMouseout);
+
+      // Create node elements (groups with circle + text)
+      nodeElements = container.append('g')
+        .attr('class', 'nodes')
+        .selectAll('g')
+        .data(nodesData, d => d.id) // Use node ID as key
+        .join('g')
+          .style('cursor', 'pointer')
+          .on('click', handleNodeClick);
+
+      nodeElements.append('circle')
+        .attr('r', 8).attr('fill', '#1f77b4').attr('stroke', '#fff').attr('stroke-width', 1.5);
+      nodeElements.append('text')
+        .text(d => d.id).attr('x', 12).attr('y', 4).style('font-size', '10px').style('fill', '#333').attr('pointer-events', 'none');
+
+      // Setup simulation
+      simulation = d3.forceSimulation(nodesData)
+         // *** FIX HERE: Correctly specify the ID accessor for nodes ***
+        .force('link', d3.forceLink(linksData).id(node => node.id).strength(0.05)) // Use node.id
+        .force('charge', d3.forceManyBody().strength(chargeStrength))
+        .force('center', d3.forceCenter(window.innerWidth / 2, window.innerHeight / 2))
+        .force('collision', d3.forceCollide().radius(12));
+
+      // Drag behavior
+      const drag = d3.drag()
+        .on('start', (event, d) => { if (!event.active) simulation.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y; })
+        .on('drag', (event, d) => { d.fx = event.x; d.fy = event.y; })
+        .on('end', (event, d) => { if (!event.active) simulation.alphaTarget(0); d.fx = null; d.fy = null; });
+      nodeElements.call(drag);
+
+      // Simulation tick function
+      simulation.on('tick', () => {
+        // Update link paths
+        linkElements.attr('d', d => {
+            // Ensure source/target nodes have been initialized by the simulation
+            if (typeof d.source !== 'object' || typeof d.target !== 'object' || !d.source.x || !d.target.x) {
+                // console.warn("Skipping link draw, source/target not ready:", d); // Optional: for debugging
+                return ''; // Don't draw if nodes aren't ready
+            }
+            const x1 = d.source.x, y1 = d.source.y, x2 = d.target.x, y2 = d.target.y;
+            const dx = x2 - x1, dy = y2 - y1;
+            let dr = Math.sqrt(dx * dx + dy * dy);
+            // Avoid dr=0 for arc calculation if nodes overlap
+            if (dr === 0) dr = 1;
+
+            const sweep = d.groupIndex % 2 === 0 ? 1 : 0;
+            if (d.groupSize > 1) {
+                const arcOffset = Math.ceil((d.groupIndex + 1) / 2) * 15 * (sweep === 1 ? 1 : -1);
+                // Ensure dr doesn't become negative or zero if offset is large
+                dr = Math.max(dr + arcOffset, 10);
+                 return `M${x1},${y1}A${dr},${dr} 0 0,${sweep} ${x2},${y2}`;
+            } else {
+                 return `M${x1},${y1}L${x2},${y2}`; // Straight line
+            }
+        });
+
+        // Update node positions
+        nodeElements.attr('transform', d => `translate(${d.x || 0},${d.y || 0})`);
+
+        // Update position of node infobox if active and type is node
+        if (activeContext && activeContext.type === 'node') {
+            const box = d3.select('.infoBox'); // Only one infobox exists
+            const nodeData = nodesData.find(n => n.id === activeContext.id);
+            if (box.node() && nodeData && nodeData.x !== undefined) {
+                const currentTransform = d3.zoomTransform(svg.node());
+                const transformedX = currentTransform.applyX(nodeData.x);
+                const transformedY = currentTransform.applyY(nodeData.y);
+                box.style('left', (transformedX + 15) + 'px')
+                   .style('top', (transformedY + 15) + 'px');
+            }
+        }
+      });
+       updateUI(); // Initial update of highlights/infobox (will be empty)
+    }
+
+    // --- Event Handlers ---
+
+    function handleNodeClick(event, d) {
+        event.stopPropagation();
+        const nodeKey = getContextKey('node', d.id);
+
+        // If this node is already selected, deselect
+        if (activeContext && activeContext.key === nodeKey) {
+            releaseColor(activeContext.color);
+            activeContext = null;
+        } else {
+            // Otherwise, select this node
+            releaseColor(activeContext?.color); // Release previous color if any
+            const color = pickColor();
+            activeContext = {
+                type: 'node',
+                id: d.id,
+                key: nodeKey,
+                color: color
+            };
+        }
+        updateUI(); // Update highlights and infobox
+    }
+
+    function handleArcClick(event, d) {
+        event.stopPropagation();
+        // Use the actual source/target IDs from the link data `d`
+        // These should be strings after the initial processing
+        const sourceId = d.source;
+        const targetId = d.target;
+        // Double-check if simulation has replaced strings with objects
+        const resolvedSourceId = typeof sourceId === 'object' ? sourceId.id : sourceId;
+        const resolvedTargetId = typeof targetId === 'object' ? targetId.id : targetId;
+
+        const arcKey = getContextKey('arc', resolvedSourceId, resolvedTargetId, d.project);
+        const projectKey = getContextKey('project', d.project);
+
+        let nextContext = null;
+        let previousColor = activeContext?.color; // Store previous color before changing context
+
+        if (activeContext && activeContext.key === arcKey) {
+            // Stage 2: Arc was selected, now select the project
+            const color = pickColor(); // Get a new color for the project stage
+            nextContext = {
+                type: 'project',
+                id: d.project,
+                key: projectKey,
+                color: color,
+                 // Store original arc data if needed for display
+                source: resolvedSourceId,
+                target: resolvedTargetId,
+                weight: d.weight
+            };
+        } else if (activeContext && activeContext.key === projectKey) {
+            // Stage 3: Project was selected, now deselect
+            nextContext = null;
+        } else {
+            // Stage 1: Nothing or something else was selected, now select the arc
+            const color = pickColor();
+            nextContext = {
+                type: 'arc',
+                id: d.project, // Use project for ID here? Or maybe combine?
+                source: resolvedSourceId,
+                target: resolvedTargetId,
+                project: d.project,
+                weight: d.weight,
+                key: arcKey,
+                color: color
+            };
+        }
+
+        // Release the color of the *previous* context only if it's different from the next
+        if (previousColor && previousColor !== nextContext?.color) {
+            releaseColor(previousColor);
+        }
+
+        activeContext = nextContext;
+        updateUI();
+    }
+
+
+    function handleArcMouseover(event, d) {
+        const sourceId = typeof d.source === 'object' ? d.source.id : d.source;
+        const targetId = typeof d.target === 'object' ? d.target.id : d.target;
+        const arcKey = getContextKey('arc', sourceId, targetId, d.project);
+        const projectKey = getContextKey('project', d.project);
+
+        // Highlight on hover only if this arc/project isn't the active context
+        if (!activeContext || (activeContext.key !== arcKey && activeContext.key !== projectKey)) {
+            d3.select(event.currentTarget)
+              .attr('stroke-opacity', 0.8)
+              .attr('stroke-width', widthScale(d.weight) * widthMultiplier + 1.5);
+        }
+    }
+
+    function handleArcMouseout(event, d) {
+         // Get IDs consistently
+         const sourceId = typeof d.source === 'object' ? d.source.id : d.source;
+         const targetId = typeof d.target === 'object' ? d.target.id : d.target;
+
+         // Reset hover effect, updateUI will reapply selection styles if needed
+         d3.select(event.currentTarget)
+            .attr('stroke-opacity', null) // Let updateUI handle opacity
+            .attr('stroke-width', null); // Let updateUI handle width
+        updateUI(); // Re-apply correct active styles
+    }
+
+    // --- Central UI Update Function ---
+    function updateUI() {
+        // 1. Remove existing infobox
+        d3.select('.infoBox').remove();
+
+        // 2. Reset highlights
+        linkElements
+            .attr('stroke', '#aaa')
+            .attr('stroke-opacity', 0.5)
+            .attr('stroke-width', d => widthScale(d.weight) * widthMultiplier);
+        nodeElements.select('circle').attr('fill', '#1f77b4'); // Default node color
+
+        // 3. If a context is active, create infobox and apply highlights
+        if (activeContext) {
+            // Create the infobox container
+            const box = d3.select('body').append('div')
+                .attr('class', 'infoBox')
+                .attr('id', sanitizeKey(activeContext.key)) // Use context key for ID
+                .style('border-color', activeContext.color)
+                .on('click', event => event.stopPropagation());
+
+            // Add close button
+            box.append('span')
+               .attr('class', 'close-btn')
+               .html('&times;')
+               .on('click', (event) => {
+                   event.stopPropagation();
+                   releaseColor(activeContext.color); // Release color on close
+                   activeContext = null;
+                   updateUI(); // Update after closing
+               });
+
+            // Apply highlights and render infobox content based on type
+            if (activeContext.type === 'node') {
+                // Highlight node
+                nodeElements.filter(d => d.id === activeContext.id)
+                    .select('circle').attr('fill', activeContext.color);
+                // Highlight connected links
+                linkElements.filter(d => {
+                     const sourceId = typeof d.source === 'object' ? d.source.id : d.source;
+                     const targetId = typeof d.target === 'object' ? d.target.id : d.target;
+                     return sourceId === activeContext.id || targetId === activeContext.id;
+                    })
+                    .attr('stroke', activeContext.color)
+                    .attr('stroke-opacity', 1)
+                    .raise();
+                // Render node info
+                renderNodeInfo(activeContext, box);
+
+            } else if (activeContext.type === 'arc') {
+                 // Highlight the specific arc path
+                linkElements.filter(d => {
+                     const sourceId = typeof d.source === 'object' ? d.source.id : d.source;
+                     const targetId = typeof d.target === 'object' ? d.target.id : d.target;
+                     return getContextKey('arc', sourceId, targetId, d.project) === activeContext.key;
+                    })
+                    .attr('stroke', activeContext.color)
+                    .attr('stroke-opacity', 1)
+                    .attr('stroke-width', d => widthScale(d.weight) * widthMultiplier + 1) // Thicker
+                    .raise();
+                // Highlight the source and target nodes
+                nodeElements.filter(d => d.id === activeContext.source || d.id === activeContext.target)
+                    .select('circle').attr('fill', activeContext.color);
+                // Render arc info
+                renderArcInfo(activeContext, box);
+
+            } else if (activeContext.type === 'project') {
+                // Highlight all links in the project
+                linkElements.filter(d => d.project === activeContext.id)
+                    .attr('stroke', activeContext.color)
+                    .attr('stroke-opacity', 1)
+                    .raise();
+                // Highlight all nodes in the project
+                const projectNodes = new Set();
+                 currentData.forEach(d => {
+                     if (d[activeContext.id] > 0) projectNodes.add(d.Name);
+                 });
+                 nodeElements.filter(d => projectNodes.has(d.id))
+                    .select('circle').attr('fill', activeContext.color);
+                // Render project info
+                renderProjectInfo(activeContext, box); // New render function
+            }
+        }
+    }
+
+
+    // --- Render InfoBox Content Functions ---
+
+    function renderNodeInfo(ctx, box) {
+        const nodeData = currentData.find(d => d.Name === ctx.id);
+        if (!nodeData) return;
+
+        const projectTotals = {};
+        projectsList.forEach(p => { projectTotals[p] = d3.sum(currentData, d => d[p] || 0); });
+
+        let tableHtml = `
+            <h4 style="color:${ctx.color}; margin-bottom: 5px;">${ctx.id}</h4>
+            <table data-order="desc">
+              <thead>
+                <tr><th>Project</th><th>Personal %</th><th>Project Share %</th></tr>
+              </thead>
+              <tbody>`;
+        projectsList.forEach(p => {
+            if (nodeData[p] > 0) {
+                const projectTotal = projectTotals[p] || 1;
+                const projectShare = ((nodeData[p] / projectTotal) * 100);
+                tableHtml += `<tr><td>${p}</td><td>${nodeData[p].toFixed(1)}%</td><td>${projectShare.toFixed(1)}%</td></tr>`;
+            }
+        });
+        tableHtml += `</tbody></table>`;
+        // Use html() which replaces content, then re-insert close button
+        box.html(tableHtml);
+        box.insert('span', ':first-child') // Re-add close button
+           .attr('class', 'close-btn')
+           .html('&times;')
+           .on('click', (event) => { event.stopPropagation(); releaseColor(activeContext?.color); activeContext = null; updateUI(); });
+
+
+        const table = box.node().querySelector('table');
+        if (table) {
+            table.querySelectorAll('thead th').forEach((th, i) => { th.onclick = () => sortTable(table, i); });
+        }
+
+        // Positioning is handled by the tick function for nodes
+        const nodeSimData = nodesData.find(n => n.id === ctx.id);
+        if (nodeSimData && nodeSimData.x !== undefined) {
+            const currentTransform = d3.zoomTransform(svg.node());
+            const transformedX = currentTransform.applyX(nodeSimData.x);
+            const transformedY = currentTransform.applyY(nodeSimData.y);
+            box.style('left', (transformedX + 15) + 'px').style('top', (transformedY + 15) + 'px');
+        } else {
+            box.style('left', '100px').style('top', '100px'); // Fallback
+        }
+    }
+
+    function renderArcInfo(ctx, box) {
+        const contentHtml = `
+            <h4 style="color:${ctx.color}; margin-bottom: 5px;">Connection Details</h4>
+            <p><strong>Project:</strong> ${ctx.project}</p>
+            <p><strong>Between:</strong> ${ctx.source} &harr; ${ctx.target}</p>
+            <p><strong>Combined Time:</strong> ${ctx.weight.toFixed(1)}%</p>
+            <p style="font-size:10px; color:#666;">(Click arc again to see full project)</p>
+        `;
+        box.html(contentHtml);
+         box.insert('span', ':first-child') // Re-add close button
+           .attr('class', 'close-btn')
+           .html('&times;')
+           .on('click', (event) => { event.stopPropagation(); releaseColor(activeContext?.color); activeContext = null; updateUI(); });
+
+        // Position fixed on the right
+        box.style('right', '10px').style('top', '10px').style('left', null);
+    }
+
+    // New function to render project info box content
+    function renderProjectInfo(ctx, box) {
+        const projectData = currentData.filter(d => d[ctx.id] > 0); // ctx.id is project name here
+        const projectTotal = d3.sum(projectData, d => d[ctx.id] || 0);
+
+        let tableHtml = `
+            <h4 style="color:${ctx.color}; margin-bottom: 5px;">Project: ${ctx.id}</h4>
+            <table data-order="desc">
+              <thead>
+                <tr><th>Person</th><th>Personal %</th><th>Project Share %</th></tr>
+              </thead>
+              <tbody>`;
+
+        projectData.sort((a,b) => (b[ctx.id] || 0) - (a[ctx.id] || 0))
+          .forEach(d => {
+            const projectShare = projectTotal > 0 ? ((d[ctx.id] / projectTotal) * 100) : 0;
+            tableHtml += `<tr><td>${d.Name}</td><td>${(d[ctx.id] || 0).toFixed(1)}%</td><td>${projectShare.toFixed(1)}%</td></tr>`;
+        });
+
+        tableHtml += `</tbody></table>
+                      <p style="font-size:10px; color:#666;">(Click associated arc again to deselect)</p>`;
+        box.html(tableHtml);
+        box.insert('span', ':first-child') // Re-add close button
+           .attr('class', 'close-btn')
+           .html('&times;')
+           .on('click', (event) => { event.stopPropagation(); releaseColor(activeContext?.color); activeContext = null; updateUI(); });
+
+
+        const table = box.node().querySelector('table');
+         if (table) {
+            table.querySelectorAll('thead th').forEach((th, i) => { th.onclick = () => sortTable(table, i); });
+        }
+
+        // Position fixed on the right
+        box.style('right', '10px').style('top', '10px').style('left', null);
+    }
+
+
+    // --- UI Event Listeners ---
+
+    document.getElementById('chargeSlider').addEventListener('input', function() {
+        chargeStrength = +this.value;
+        document.getElementById('chargeValue').textContent = chargeStrength;
+        if (simulation) { simulation.force('charge').strength(chargeStrength); simulation.alpha(0.3).restart(); }
+    });
+
+    document.getElementById('widthSlider').addEventListener('input', function() {
+        widthMultiplier = +this.value;
+        document.getElementById('widthValue').textContent = widthMultiplier.toFixed(1);
+        updateUI(); // Redraw highlights with new base width
+    });
+
+    const zoom = d3.zoom()
+        .scaleExtent([0.1, 8])
+        .on('zoom', (event) => {
+            container.attr('transform', event.transform);
+            // Update node infobox position during zoom
+            if (activeContext && activeContext.type === 'node') {
+                 const box = d3.select('.infoBox');
+                 const nodeData = nodesData.find(n => n.id === activeContext.id);
+                 if (box.node() && nodeData && nodeData.x !== undefined) {
+                    const transformedX = event.transform.applyX(nodeData.x);
+                    const transformedY = event.transform.applyY(nodeData.y);
+                    box.style('left', (transformedX + 15) + 'px').style('top', (transformedY + 15) + 'px');
+                }
+            }
+             // Arc/Project boxes have fixed position, no update needed on zoom
+        });
+    svg.call(zoom);
+
+    document.getElementById('menuToggle').addEventListener('click', () => {
+        document.getElementById('sidebar').classList.toggle('open');
+    });
+
+    document.getElementById('loadBtn').addEventListener('click', () => {
+        const csvText = document.getElementById('csv-input').value.trim();
+        if (!csvText) { alert("CSV input is empty."); return; }
+        try {
+            const data = d3.csvParse(csvText);
+            const hasNameColumn = data.columns && data.columns.some(col => col.toLowerCase() === 'name');
+            if (!hasNameColumn) { alert('CSV data must include a "Name" column.'); return; }
+            if (data.length === 0) { alert('CSV data parsed but resulted in zero rows.'); return; }
+            // Release color before loading new data
+            releaseColor(activeContext?.color);
+            activeContext = null;
+            updateGraph(data); // This now clears context and calls updateUI
+            document.getElementById('sidebar').classList.remove('open');
+        } catch (e) {
+            console.error("CSV parsing error:", e);
+            alert('Failed to parse CSV data. Check the format and console for details.\nError: ' + e.message);
+        }
+    });
+
+    // Clicking SVG background clears selection
+    svg.on('click', () => {
+        if (activeContext) {
+            releaseColor(activeContext.color); // Release color on background click
+            activeContext = null;
+            updateUI();
+        }
+    });
+
+    // --- Initial Setup ---
+    function resizeSVG() {
+        svg.attr('width', window.innerWidth).attr('height', window.innerHeight);
+        if (simulation) {
+            simulation.force('center', d3.forceCenter(window.innerWidth / 2, window.innerHeight / 2));
+        }
+    }
+    window.addEventListener('resize', resizeSVG);
+    resizeSVG();
+
+    const exampleCSV = `Name,Project Alpha,Project Beta,Project Gamma,Project Delta,Project Epsilon,Project Zeta
+Ryan Johnson,30,20,50,0,0,0
+Alice Smith,0,40,20,10,30,0
+Bob Lee,10,0,0,60,20,10
+Carol Tan,20,10,0,0,30,40
+David Chen,0,30,30,0,0,40
+Eva Green,40,0,0,30,30,0`;
+    document.getElementById('csv-input').value = exampleCSV;
+    try {
+        // *** FIX HERE: Ensure initial data is parsed before updating ***
+        const initialData = d3.csvParse(exampleCSV);
+        if (!initialData || initialData.length === 0) {
+            throw new Error("Parsed initial data is empty.");
+        }
+        updateGraph(initialData);
+    } catch(e) {
+        console.error("Error loading initial example data:", e);
+        // *** FIX HERE: Include error message in alert ***
+        alert("Error loading initial example data: " + e.message);
+    }
+
+  </script>
+</body>
+</html>
